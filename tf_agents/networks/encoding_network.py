@@ -163,19 +163,15 @@ class EncodingNetwork(network.Network):
         input_nest = [input_tensor_spec]
       nest.assert_shallow_structure(
           preprocessing_layers, input_nest, check_types=False)
-      if len(flat_preprocessing_layers) > 1 and preprocessing_combiner is None:
-        raise ValueError(
-            'preprocessing_combiner layer is required when more than 1 '
-            'preprocessing_layer is provided.')
+
+    if (len(tf.nest.flatten(input_tensor_spec)) > 1 and
+        preprocessing_combiner is None):
+      raise ValueError(
+          'preprocessing_combiner layer is required when more than 1 '
+          'input_tensor_spec is provided.')
 
     if preprocessing_combiner is not None:
       preprocessing_combiner = _copy_layer(preprocessing_combiner)
-
-    if not (preprocessing_layers or preprocessing_combiner or
-            conv_layer_params or fc_layer_params):
-      raise ValueError(
-          'At least one: preprocessing_layers, preprocessing_combiner, '
-          'conv_layer_params, or fc_layer_params should be provided.')
 
     if not kernel_initializer:
       kernel_initializer = tf.compat.v1.variance_scaling_initializer(
@@ -223,7 +219,11 @@ class EncodingNetwork(network.Network):
     super(EncodingNetwork, self).__init__(
         input_tensor_spec=input_tensor_spec, state_spec=(), name=name)
 
-    self._preprocessing_layers = preprocessing_layers
+    # Pull out the nest structure of the preprocessing layers. This avoids
+    # saving the original kwarg layers as a class attribute which Keras would
+    # then track.
+    self._preprocessing_nest = tf.nest.map_structure(lambda l: None,
+                                                     preprocessing_layers)
     self._flat_preprocessing_layers = flat_preprocessing_layers
     self._preprocessing_combiner = preprocessing_combiner
     self._postprocessing_layers = layers
@@ -238,13 +238,13 @@ class EncodingNetwork(network.Network):
       batch_squash = utils.BatchSquash(outer_rank)
       observation = tf.nest.map_structure(batch_squash.flatten, observation)
 
-    if self._preprocessing_layers is None:
+    if self._flat_preprocessing_layers is None:
       processed = observation
     else:
       processed = []
       for obs, layer in zip(
           nest.flatten_up_to(
-              self._preprocessing_layers, observation, check_types=False),
+              self._preprocessing_nest, observation, check_types=False),
           self._flat_preprocessing_layers):
         processed.append(layer(obs))
       if len(processed) == 1 and self._preprocessing_combiner is None:
