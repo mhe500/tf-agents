@@ -76,12 +76,27 @@ class DummyCategoricalNet(network.Network):
   def num_atoms(self):
     return self._num_atoms
 
-  def call(self, inputs, unused_step_type=None, network_state=()):
+  def call(self, inputs, step_type=None, network_state=()):
+    del step_type
     inputs = tf.cast(inputs, tf.float32)
     for layer in self._dummy_layers:
       inputs = layer(inputs)
     logits = tf.reshape(inputs, [-1, self._num_actions, self._num_atoms])
     return logits, network_state
+
+
+class KerasLayersNet(network.Network):
+
+  def __init__(self, observation_spec, action_spec, layer, num_atoms=5,
+               name=None):
+    super(KerasLayersNet, self).__init__(observation_spec, state_spec=(),
+                                         name=name)
+    self._layer = layer
+    self.num_atoms = num_atoms  # Dummy, this doesn't match the layer output.
+
+  def call(self, inputs, step_type=None, network_state=()):
+    del step_type
+    return self._layer(inputs), network_state
 
 
 class DummyCategoricalQRnnNetwork(q_rnn_network.QRnnNetwork):
@@ -124,7 +139,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
 
   def setUp(self):
     super(CategoricalDqnAgentTest, self).setUp()
-    tf.enable_resource_variables()
+    tf.compat.v1.enable_resource_variables()
     self._obs_spec = tensor_spec.TensorSpec([2], tf.float32)
     self._time_step_spec = ts.time_step_spec(self._obs_spec)
     self._action_spec = tensor_spec.BoundedTensorSpec((), tf.int32, 0, 1)
@@ -133,7 +148,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
         self._action_spec,
         fc_layer_params=[4])
     self._dummy_categorical_net = DummyCategoricalNet(self._obs_spec)
-    self._optimizer = tf.train.GradientDescentOptimizer(0.01)
+    self._optimizer = tf.compat.v1.train.GradientDescentOptimizer(0.01)
 
   def testCreateAgentNestSizeChecks(self):
     action_spec = [
@@ -167,6 +182,40 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
         self._categorical_net,
         self._optimizer)
 
+  def testCreateAgentWithPrebuiltPreprocessingLayers(self):
+    dense_layer = tf.keras.layers.Dense(3)
+    q_net = KerasLayersNet(
+        self._time_step_spec.observation, self._action_spec, dense_layer)
+    with self.assertRaisesRegexp(
+        ValueError, 'shares weights with the original network'):
+      categorical_dqn_agent.CategoricalDqnAgent(
+          self._time_step_spec,
+          self._action_spec,
+          categorical_q_network=q_net,
+          optimizer=None)
+
+    # Explicitly share weights between q and target networks; this is ok.
+    q_target_net = KerasLayersNet(
+        self._time_step_spec.observation, self._action_spec, dense_layer)
+    categorical_dqn_agent.CategoricalDqnAgent(
+        self._time_step_spec,
+        self._action_spec,
+        categorical_q_network=q_net,
+        optimizer=None,
+        target_categorical_q_network=q_target_net)
+
+    q_bad_target_net = KerasLayersNet(
+        self._time_step_spec.observation, self._action_spec, dense_layer,
+        num_atoms=3)
+
+    with self.assertRaisesRegexp(ValueError, 'have different numbers of atoms'):
+      categorical_dqn_agent.CategoricalDqnAgent(
+          self._time_step_spec,
+          self._action_spec,
+          categorical_q_network=q_net,
+          optimizer=None,
+          target_categorical_q_network=q_bad_target_net)
+
   def testCriticLoss(self):
     agent = categorical_dqn_agent.CategoricalDqnAgent(
         self._time_step_spec,
@@ -190,12 +239,57 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
 
     # Due to the constant initialization of the DummyCategoricalNet, we can
     # expect the same loss every time.
-    expected_loss = 2.195
+    expected_loss = 2.19525
     loss_info = agent._loss(experience)
 
-    self.evaluate(tf.global_variables_initializer())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     evaluated_loss = self.evaluate(loss_info).loss
-    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-3)
+    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-4)
+
+  def testCriticLossWithMaskedActions(self):
+    # Observations are now a tuple of the usual observation and an action mask.
+    observation_spec_with_mask = (
+        self._obs_spec,
+        tensor_spec.BoundedTensorSpec([2], tf.int32, 0, 1))
+    time_step_spec = ts.time_step_spec(observation_spec_with_mask)
+    dummy_categorical_net = DummyCategoricalNet(self._obs_spec)
+    agent = categorical_dqn_agent.CategoricalDqnAgent(
+        time_step_spec,
+        self._action_spec,
+        dummy_categorical_net,
+        self._optimizer,
+        observation_and_action_constraint_splitter=lambda x: (x[0], x[1]))
+
+    # For `observations`, the masks are set up so that only one action is valid
+    # for each element in the batch.
+    observations = (tf.constant([[1, 2], [3, 4]], dtype=tf.float32),
+                    tf.constant([[1, 0], [0, 1]], dtype=tf.int32))
+    time_steps = ts.restart(observations, batch_size=2)
+
+    actions = tf.constant([0, 1], dtype=tf.int32)
+    action_steps = policy_step.PolicyStep(actions)
+
+    rewards = tf.constant([10, 20], dtype=tf.float32)
+    discounts = tf.constant([0.9, 0.9], dtype=tf.float32)
+
+    # For `next_observations`, the masks are set up so the opposite actions as
+    # before are valid.
+    next_observations = (tf.constant([[5, 6], [7, 8]], dtype=tf.float32),
+                         tf.constant([[0, 1], [1, 0]], dtype=tf.int32))
+    next_time_steps = ts.transition(next_observations, rewards, discounts)
+
+    experience = test_utils.stacked_trajectory_from_transition(
+        time_steps, action_steps, next_time_steps)
+
+    # Due to the constant initialization of the DummyCategoricalNet, we can
+    # expect the same loss every time. Note this is different from the loss in
+    # testCriticLoss above due to previously optimal actions being masked out.
+    expected_loss = 5.062895
+    loss_info = agent._loss(experience)
+
+    self.evaluate(tf.compat.v1.global_variables_initializer())
+    evaluated_loss = self.evaluate(loss_info).loss
+    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-4)
 
   def testCriticLossNStep(self):
     agent = categorical_dqn_agent.CategoricalDqnAgent(
@@ -235,19 +329,19 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
     # discounted_returns should evaluate to 10 + 0.9 * 10 = 19 and
     # 20 + 0.9 * 20 = 38.
     evaluated_discounted_returns = self.evaluate(agent._discounted_returns)
-    self.assertAllClose(evaluated_discounted_returns, [[19], [38]], atol=1e-3)
+    self.assertAllClose(evaluated_discounted_returns, [[19], [38]], atol=1e-4)
 
     # Both final_value_discount values should be 0.9 * 0.9 = 0.81.
     evaluated_final_value_discount = self.evaluate(agent._final_value_discount)
     self.assertAllClose(evaluated_final_value_discount, [[0.81], [0.81]],
-                        atol=1e-3)
+                        atol=1e-4)
 
     # Due to the constant initialization of the DummyCategoricalNet, we can
     # expect the same loss every time.
-    expected_loss = 2.195
-    self.evaluate(tf.global_variables_initializer())
+    expected_loss = 2.19525
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     evaluated_loss = self.evaluate(loss_info).loss
-    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-3)
+    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-4)
 
   def testPolicy(self):
     agent = categorical_dqn_agent.CategoricalDqnAgent(
@@ -260,7 +354,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
     time_steps = ts.restart(observations, batch_size=2)
     actions, _, _ = agent.policy.action(time_steps)
     self.assertEqual(actions.shape, [2])
-    self.evaluate(tf.global_variables_initializer())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     actions_ = self.evaluate(actions)
     self.assertTrue(all(actions_ <= self._action_spec.maximum))
     self.assertTrue(all(actions_ >= self._action_spec.minimum))
@@ -287,7 +381,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
     loss_info = agent._loss(experience)
     initialize = agent.initialize()
 
-    self.evaluate(tf.global_variables_initializer())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     losses = self.evaluate(loss_info).loss
     self.assertGreater(losses, 0.0)
 
@@ -316,7 +410,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
     loss_info = agent._loss(experience)
     update_targets = agent._update_target()
 
-    self.evaluate(tf.global_variables_initializer())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     losses = self.evaluate(loss_info).loss
     self.assertGreater(losses, 0.0)
     self.evaluate(update_targets)
@@ -346,10 +440,10 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
 
     # Due to the constant initialization of the DummyCategoricalNet, we can
     # expect the same loss every time.
-    expected_loss = 2.195
-    self.evaluate(tf.global_variables_initializer())
+    expected_loss = 2.19525
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     evaluated_loss, _ = self.evaluate(train_step)
-    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-3)
+    self.assertAllClose(evaluated_loss, expected_loss, atol=1e-4)
 
   def testTrainWithRnn(self):
     action_spec = tensor_spec.BoundedTensorSpec([1], tf.int32, 0, 1)
@@ -389,7 +483,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
         self._time_step_spec,
         action_spec,
         categorical_q_rnn_network,
-        optimizer=tf.train.AdamOptimizer(0.001),
+        optimizer=tf.compat.v1.train.AdamOptimizer(0.001),
     )
 
     # Force variable creation.
@@ -399,7 +493,7 @@ class CategoricalDqnAgentTest(tf.test.TestCase):
     else:
       loss = agent.train(experience)
 
-    self.evaluate(tf.compat.v1.initialize_all_variables())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     self.assertEqual(self.evaluate(counter), 0)
     self.evaluate(loss)
 

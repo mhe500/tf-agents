@@ -19,9 +19,10 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
+import cProfile
 import math
+import pstats
 
-from absl.testing import absltest
 from absl.testing import parameterized
 from absl.testing.absltest import mock
 
@@ -35,6 +36,7 @@ from tf_agents.environments import random_py_environment
 from tf_agents.environments import wrappers
 from tf_agents.specs import array_spec
 from tf_agents.trajectories import time_step as ts
+from tf_agents.utils import test_utils
 
 
 class PyEnvironmentBaseWrapperTest(parameterized.TestCase):
@@ -87,7 +89,7 @@ class PyEnvironmentBaseWrapperTest(parameterized.TestCase):
     self.assertEqual(1, mock_env.close.call_count)
 
 
-class TimeLimitWrapperTest(absltest.TestCase):
+class TimeLimitWrapperTest(test_utils.TestCase):
 
   def test_limit_duration_wrapped_env_forwards_calls(self):
     cartpole_env = gym.spec('CartPole-v1').make()
@@ -175,17 +177,30 @@ class TimeLimitWrapperTest(absltest.TestCase):
     self.assertTrue(last_time_step.is_last())
 
 
-class ActionRepeatWrapperTest(absltest.TestCase):
+class ActionRepeatWrapperTest(test_utils.TestCase):
 
   def _get_mock_env_episode(self):
     mock_env = mock.MagicMock()
     mock_env.step.side_effect = [
-        ts.TimeStep(ts.StepType.FIRST, 2, 1, [0]),
-        ts.TimeStep(ts.StepType.MID, 3, 1, [1]),
-        ts.TimeStep(ts.StepType.MID, 5, 1, [2]),
-        ts.TimeStep(ts.StepType.LAST, 7, 1, [3]),
+        # In practice, the first reward would be 0, but test with a reward of 1.
+        ts.TimeStep(ts.StepType.FIRST, 1, 1, [0]),
+        ts.TimeStep(ts.StepType.MID, 2, 1, [1]),
+        ts.TimeStep(ts.StepType.MID, 3, 1, [2]),
+        ts.TimeStep(ts.StepType.MID, 5, 1, [3]),
+        ts.TimeStep(ts.StepType.LAST, 7, 1, [4]),
     ]
     return mock_env
+
+  def test_action_stops_on_first(self):
+    mock_env = self._get_mock_env_episode()
+    env = wrappers.ActionRepeat(mock_env, 3)
+    env.reset()
+
+    time_step = env.step([2])
+    mock_env.step.assert_has_calls([mock.call([2])])
+
+    self.assertEqual(1, time_step.reward)
+    self.assertEqual([0], time_step.observation)
 
   def test_action_repeated(self):
     mock_env = self._get_mock_env_episode()
@@ -193,7 +208,9 @@ class ActionRepeatWrapperTest(absltest.TestCase):
     env.reset()
 
     env.step([2])
-    mock_env.step.assert_has_calls([mock.call([2])] * 3)
+    env.step([3])
+    mock_env.step.assert_has_calls([mock.call([2])] +
+                                   [mock.call([3])] * 3)
 
   def test_action_stops_on_last(self):
     mock_env = self._get_mock_env_episode()
@@ -201,12 +218,14 @@ class ActionRepeatWrapperTest(absltest.TestCase):
     env.reset()
 
     env.step([2])
-    time_step = env.step([3])
-    mock_env.step.assert_has_calls([mock.call([2])] * 3 +
-                                   [mock.call([3])])
+    env.step([3])
+    time_step = env.step([4])
+    mock_env.step.assert_has_calls([mock.call([2])] +
+                                   [mock.call([3])] * 3 +
+                                   [mock.call([4])])
 
     self.assertEqual(7, time_step.reward)
-    self.assertEqual([3], time_step.observation)
+    self.assertEqual([4], time_step.observation)
 
   def test_checks_times_param(self):
     mock_env = mock.MagicMock()
@@ -217,14 +236,16 @@ class ActionRepeatWrapperTest(absltest.TestCase):
     mock_env = self._get_mock_env_episode()
     env = wrappers.ActionRepeat(mock_env, 3)
     env.reset()
+
+    env.step(0)
     time_step = env.step(0)
 
     mock_env.step.assert_called_with(0)
     self.assertEqual(10, time_step.reward)
-    self.assertEqual([2], time_step.observation)
+    self.assertEqual([3], time_step.observation)
 
 
-class RunStatsWrapperTest(absltest.TestCase):
+class RunStatsWrapperTest(test_utils.TestCase):
 
   def test_episode_count(self):
     cartpole_env = gym.make('CartPole-v1')
@@ -291,7 +312,7 @@ class RunStatsWrapperTest(absltest.TestCase):
       resets += 1
 
 
-class ActionDiscretizeWrapper(absltest.TestCase):
+class ActionDiscretizeWrapper(test_utils.TestCase):
 
   def test_discrete_spec_scalar_limit(self):
     obs_spec = array_spec.BoundedArraySpec((2, 3), np.int32, -10, 10)
@@ -475,7 +496,7 @@ class ActionDiscretizeWrapper(absltest.TestCase):
                                            action['action1'])
 
 
-class ActionClipWrapper(absltest.TestCase):
+class ActionClipWrapper(test_utils.TestCase):
 
   def test_clip(self):
     obs_spec = array_spec.BoundedArraySpec((2, 3), np.int32, -10, 10)
@@ -550,7 +571,7 @@ class ActionClipWrapper(absltest.TestCase):
       np.testing.assert_array_almost_equal([3, -3], action[1][1])
 
 
-class ActionOffsetWrapperTest(absltest.TestCase):
+class ActionOffsetWrapperTest(test_utils.TestCase):
 
   def test_nested(self):
     obs_spec = array_spec.BoundedArraySpec((2, 3), np.int32, -10, 10)
@@ -873,7 +894,7 @@ class CountingEnv(py_environment.PyEnvironment):
     return ts.termination(self._count.copy(), 1)
 
 
-class HistoryWrapperTest(absltest.TestCase):
+class HistoryWrapperTest(test_utils.TestCase):
 
   def test_observation_spec_changed(self):
     cartpole_env = gym.spec('CartPole-v1').make()
@@ -930,5 +951,42 @@ class HistoryWrapperTest(absltest.TestCase):
     self.assertEqual([5, 6, 7], time_step.observation['action'].tolist())
 
 
+class PerformanceProfilerWrapperTest(test_utils.TestCase):
+
+  def test_profiling(self):
+    cartpole_env = gym.make('CartPole-v1')
+    env = gym_wrapper.GymWrapper(cartpole_env)
+    profile = [None]
+    def profile_fn(p):
+      self.assertIsInstance(p, cProfile.Profile)
+      profile[0] = p
+
+    env = wrappers.PerformanceProfiler(
+        env, process_profile_fn=profile_fn,
+        process_steps=2)
+
+    env.reset()
+
+    # Resets are also profiled.
+    s = pstats.Stats(env._profile)
+    self.assertGreater(s.total_calls, 0)
+
+    for _ in range(2):
+      env.step(1)
+
+    self.assertIsNotNone(profile[0])
+    previous_profile = profile[0]
+
+    updated_s = pstats.Stats(profile[0])
+    self.assertGreater(updated_s.total_calls, s.total_calls)
+
+    for _ in range(2):
+      env.step(1)
+
+    self.assertIsNotNone(profile[0])
+    # We saw a new profile.
+    self.assertNotEqual(profile[0], previous_profile)
+
+
 if __name__ == '__main__':
-  absltest.main()
+  test_utils.main()

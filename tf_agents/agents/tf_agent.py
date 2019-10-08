@@ -49,6 +49,7 @@ class TFAgent(tf.Module):
                num_outer_dims=2,
                debug_summaries=False,
                summarize_grads_and_vars=False,
+               enable_summaries=True,
                train_step_counter=None):
     """Meant to be called by subclass constructors.
 
@@ -77,6 +78,10 @@ class TFAgent(tf.Module):
         summaries.
       summarize_grads_and_vars: A bool; if true, subclasses should additionally
         collect gradient and variable summaries.
+      enable_summaries: A bool; if false, subclasses should not gather any
+        summaries (debug or otherwise); subclasses should gate *all* summaries
+        using either `summaries_enabled`, `debug_summaries`, or
+        `summarize_grads_and_vars` properties.
       train_step_counter: An optional counter to increment every time the train
         op is run.  Defaults to the global_step.
 
@@ -101,6 +106,7 @@ class TFAgent(tf.Module):
     self._num_outer_dims = num_outer_dims
     self._debug_summaries = debug_summaries
     self._summarize_grads_and_vars = summarize_grads_and_vars
+    self._enable_summaries = enable_summaries
     if train_step_counter is None:
       train_step_counter = tf.compat.v1.train.get_or_create_global_step()
     self._train_step_counter = train_step_counter
@@ -140,18 +146,18 @@ class TFAgent(tf.Module):
             "All of the Tensors in `experience` must have two outer "
             "dimensions: batch size and time. Specifically, tensors should be "
             "shaped as [B x T x ...].\n"
-            "Full shapes of experience tensors:\n%s.\n"
-            "Full expected shapes (minus outer dimensions):\n%s." %
-            (debug_str_1, debug_str_2))
+            "Full shapes of experience tensors:\n{}.\n"
+            "Full expected shapes (minus outer dimensions):\n{}.".format(
+                debug_str_1, debug_str_2))
       else:
         # self._num_outer_dims must be 1.
         raise ValueError(
             "All of the Tensors in `experience` must have a single outer "
             "batch_size dimension. If you also want to include an outer time "
             "dimension, set num_outer_dims=2 when initializing your agent.\n"
-            "Full shapes of experience tensors:\n%s.\n"
-            "Full expected shapes (minus batch_size dimension):\n%s." %
-            (debug_str_1, debug_str_2))
+            "Full shapes of experience tensors:\n{}.\n"
+            "Full expected shapes (minus batch_size dimension):\n{}.".format(
+                debug_str_1, debug_str_2))
 
     # If we have a time dimension and a train_sequence_length, make sure they
     # match.
@@ -172,9 +178,9 @@ class TFAgent(tf.Module):
 
     Args:
       experience: A batch of experience data in the form of a `Trajectory`. The
-        structure of `experience` must match that of `self.policy.step_spec`.
+        structure of `experience` must match that of `self.collect_data_spec`.
         All tensors in `experience` must be shaped `[batch, time, ...]` where
-        `time` must be equal to `self.required_experience_time_steps` if that
+        `time` must be equal to `self.train_step_length` if that
         property is not `None`.
       weights: (optional).  A `Tensor`, either `0-D` or shaped `[batch]`,
         containing weights to be used when calculating the total train loss.
@@ -287,12 +293,16 @@ class TFAgent(tf.Module):
     return self._train_sequence_length
 
   @property
+  def summaries_enabled(self):
+    return self._enable_summaries
+
+  @property
   def debug_summaries(self):
-    return self._debug_summaries
+    return self._debug_summaries and self.summaries_enabled
 
   @property
   def summarize_grads_and_vars(self):
-    return self._summarize_grads_and_vars
+    return self._summarize_grads_and_vars and self.summaries_enabled
 
   @property
   def train_step_counter(self):
@@ -312,10 +322,10 @@ class TFAgent(tf.Module):
 
     Args:
       experience: A batch of experience data in the form of a `Trajectory`. The
-        structure of `experience` must match that of `self.policy.step_spec`.
+        structure of `experience` must match that of `self.collect_data_spec`.
         All tensors in `experience` must be shaped `[batch, time, ...]` where
-        `time` must be equal to `self.required_experience_time_steps` if that
-        property is not `None`.
+        `time` must be equal to `self.train_step_length` if that property is
+        not `None`.
       weights: (optional).  A `Tensor`, either `0-D` or shaped `[batch]`,
         containing weights to be used when calculating the total train loss.
         Weights are typically multiplied elementwise against the per-batch loss,

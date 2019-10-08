@@ -28,6 +28,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from absl import logging
 import gin
 import tensorflow as tf
 
@@ -37,11 +38,39 @@ from tf_agents.utils import nest_utils
 
 from tensorflow.python.util import nest  # pylint:disable=g-direct-tensorflow-import  # TF internal
 
+CONV_TYPE_2D = '2d'
+CONV_TYPE_1D = '1d'
+
 
 def _copy_layer(layer):
+  """Create a copy of a Keras layer with identical parameters.
+
+  The new layer will not share weights with the old one.
+
+  Args:
+    layer: An instance of `tf.keras.layers.Layer`.
+
+  Returns:
+    A new keras layer.
+
+  Raises:
+    TypeError: If `layer` is not a keras layer.
+    ValueError: If `layer` cannot be correctly cloned.
+  """
   if not isinstance(layer, tf.keras.layers.Layer):
     raise TypeError('layer is not a keras layer: %s' % str(layer))
-  # Get a fresh copy so we don't modify an incoming layer in place.
+
+  # pylint:disable=unidiomatic-typecheck
+  if type(layer) == tf.compat.v1.keras.layers.DenseFeatures:
+    raise ValueError('DenseFeatures V1 is not supported. '
+                     'Use tf.compat.v2.keras.layers.DenseFeatures instead.')
+  if layer.built:
+    logging.warn(
+        'Beware: Copying a layer that has already been built: \'%s\'.  '
+        'This can lead to subtle bugs because the original layer\'s weights '
+        'will not be used in the copy.', layer.name)
+  # Get a fresh copy so we don't modify an incoming layer in place.  Weights
+  # will not be shared.
   return type(layer).from_config(layer.get_config())
 
 
@@ -60,7 +89,8 @@ class EncodingNetwork(network.Network):
                kernel_initializer=None,
                batch_squash=True,
                dtype=tf.float32,
-               name='EncodingNetwork'):
+               name='EncodingNetwork',
+               conv_type=CONV_TYPE_2D):
     """Creates an instance of `EncodingNetwork`.
 
     Network supports calls with shape outer_rank + input_tensor_spec.shape. Note
@@ -120,8 +150,9 @@ class EncodingNetwork(network.Network):
         `tf.keras.layers.Add` and `tf.keras.layers.Concatenate(axis=-1)`. This
         layer must not be already built.
       conv_layer_params: Optional list of convolution layers parameters, where
-        each item is a length-three tuple indicating (filters, kernel_size,
-        stride).
+        each item is either a length-three tuple indicating
+        `(filters, kernel_size, stride)` or a length-four tuple indicating
+        `(filters, kernel_size, stride, dilation_rate)`.
       fc_layer_params: Optional list of fully_connected parameters, where each
         item is the number of units in the layer.
       dropout_layer_params: Optional list of dropout layer parameters, each item
@@ -140,12 +171,15 @@ class EncodingNetwork(network.Network):
         observations with shape [BxTx...].
       dtype: The dtype to use by the convolution and fully connected layers.
       name: A string representing name of the network.
+      conv_type: string, '1d' or '2d'. Convolution layers will be 1d or 2D
+        respectively
 
     Raises:
       ValueError: If any of `preprocessing_layers` is already built.
       ValueError: If `preprocessing_combiner` is already built.
       ValueError: If the number of dropout layer parameters does not match the
         number of fully connected layer parameters.
+      ValueError: If conv_layer_params tuples do not have 3 or 4 elements each.
     """
     if preprocessing_layers is None:
       flat_preprocessing_layers = None
@@ -180,16 +214,33 @@ class EncodingNetwork(network.Network):
     layers = []
 
     if conv_layer_params:
-      for (filters, kernel_size, strides) in conv_layer_params:
+      if conv_type == '2d':
+        conv_layer_type = tf.keras.layers.Conv2D
+      elif conv_type == '1d':
+        conv_layer_type = tf.keras.layers.Conv1D
+      else:
+        raise ValueError('unsupported conv type of %s. Use 1d or 2d' % (
+            conv_type))
+
+      for config in conv_layer_params:
+        if len(config) == 4:
+          (filters, kernel_size, strides, dilation_rate) = config
+        elif len(config) == 3:
+          (filters, kernel_size, strides) = config
+          dilation_rate = (1, 1) if conv_type == '2d' else (1,)
+        else:
+          raise ValueError(
+              'only 3 or 4 elements permitted in conv_layer_params tuples')
         layers.append(
-            tf.keras.layers.Conv2D(
+            conv_layer_type(
                 filters=filters,
                 kernel_size=kernel_size,
                 strides=strides,
+                dilation_rate=dilation_rate,
                 activation=activation_fn,
                 kernel_initializer=kernel_initializer,
                 dtype=dtype,
-                name='%s/conv2d' % name))
+                name='%s/conv%s' % (name, conv_type)))
 
     layers.append(tf.keras.layers.Flatten())
 
@@ -233,8 +284,8 @@ class EncodingNetwork(network.Network):
     del step_type  # unused.
 
     if self._batch_squash:
-      outer_rank = nest_utils.get_outer_rank(observation,
-                                             self.input_tensor_spec)
+      outer_rank = nest_utils.get_outer_rank(
+          observation, self.input_tensor_spec)
       batch_squash = utils.BatchSquash(outer_rank)
       observation = tf.nest.map_structure(batch_squash.flatten, observation)
 
@@ -248,7 +299,7 @@ class EncodingNetwork(network.Network):
           self._flat_preprocessing_layers):
         processed.append(layer(obs))
       if len(processed) == 1 and self._preprocessing_combiner is None:
-        # If only only one observation is passed and preprocessing_combiner
+        # If only one observation is passed and the preprocessing_combiner
         # is unspecified, use the preprocessed version of this observation.
         processed = processed[0]
 

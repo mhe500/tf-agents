@@ -20,8 +20,8 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
-import sys
 import six
+
 import tensorflow as tf
 
 from tensorflow.keras import layers  # pylint: disable=unused-import
@@ -101,6 +101,15 @@ class Network(keras_network.Network):
   """Base extension to Keras network to simplify copy operations."""
 
   def __init__(self, input_tensor_spec, state_spec, name):
+    """Creates an instance of `Network`.
+
+    Args:
+      input_tensor_spec: A nest of `tensor_spec.TensorSpec` representing the
+        input observations.
+      state_spec: A nest of `tensor_spec.TensorSpec` representing the state
+        needed by the network. Use () if none.
+      name: A string representing the name of the network.
+    """
     super(Network, self).__init__(name=name)
     self._input_tensor_spec = input_tensor_spec
     self._state_spec = state_spec
@@ -109,36 +118,37 @@ class Network(keras_network.Network):
   def state_spec(self):
     return self._state_spec
 
-  def _build(self):
-    if not self.built and self.input_tensor_spec is not None:
-      random_input = tensor_spec.sample_spec_nest(
-          self.input_tensor_spec, outer_dims=(1,))
-      step_type = tf.expand_dims(time_step.StepType.FIRST, 0)
-      self.__call__(random_input, step_type, None)
-
   @property
   def input_tensor_spec(self):
     """Returns the spec of the input to the network of type InputSpec."""
     return self._input_tensor_spec
 
+  def create_variables(self, **kwargs):
+    if not self.built:
+      random_input = tensor_spec.sample_spec_nest(
+          self.input_tensor_spec, outer_dims=(0,))
+      random_state = tensor_spec.sample_spec_nest(
+          self.state_spec, outer_dims=(0,))
+      step_type = tf.zeros([time_step.StepType.FIRST], dtype=tf.int32)
+      self.__call__(
+          random_input, step_type=step_type, network_state=random_state,
+          **kwargs)
+
   @property
   def variables(self):
-    """Return the variables for all the network layers.
+    if not self.built:
+      raise ValueError(
+          "Network has not been built, unable to access variables.  "
+          "Please call `create_variables` or apply the network first.")
+    return super(Network, self).variables
 
-    If the network hasn't been built, builds it on random input (generated
-    using self._input_tensor_spec) to build all the layers and their variables.
-
-    Raises:
-      ValueError:  If the network fails to build.
-    """
-    try:
-      self._build()
-    except ValueError as e:
-      traceback = sys.exc_info()[2]
-      six.reraise(
-          ValueError, "Failed to call build on the network when accessing "
-          "variables. Message: {!r}.".format(e), traceback)
-    return self.weights
+  @property
+  def trainable_variables(self):
+    if not self.built:
+      raise ValueError(
+          "Network has not been built, unable to access variables.  "
+          "Please call `create_variables` or apply the network first.")
+    return super(Network, self).trainable_variables
 
   def copy(self, **kwargs):
     """Create a shallow copy of this network.

@@ -50,10 +50,14 @@ class CategoricalProjectionNetwork(network.DistributionNetwork):
                                    1)
     if len(unique_num_actions) > 1 or np.any(unique_num_actions <= 0):
       raise ValueError('Bounds on discrete actions must be the same for all '
-                       'dimensions and have at least 1 action.')
+                       'dimensions and have at least 1 action. Projection '
+                       'Network requires num_actions to be equal across '
+                       'action dimensions. Implement a more general '
+                       'categorical projection if you need more flexibility.')
 
     output_shape = sample_spec.shape.concatenate([unique_num_actions])
-    output_spec = self._output_distribution_spec(output_shape, sample_spec)
+    output_spec = self._output_distribution_spec(output_shape, sample_spec,
+                                                 name)
 
     super(CategoricalProjectionNetwork, self).__init__(
         # We don't need these, but base class requires them.
@@ -69,12 +73,6 @@ class CategoricalProjectionNetwork(network.DistributionNetwork):
     if not tensor_spec.is_discrete(sample_spec):
       raise ValueError('sample_spec must be discrete. Got: %s.' % sample_spec)
 
-    if len(unique_num_actions) > 1:
-      raise ValueError(
-          'Projection Network requires num_actions to be equal '
-          'across action dimensions. Implement a more general categorical '
-          'projection if you need more flexibility.')
-
     self._sample_spec = sample_spec
     self._output_shape = output_shape
 
@@ -85,9 +83,13 @@ class CategoricalProjectionNetwork(network.DistributionNetwork):
         bias_initializer=tf.keras.initializers.Zeros(),
         name='logits')
 
-  def _output_distribution_spec(self, output_shape, sample_spec):
+  def _output_distribution_spec(self, output_shape, sample_spec, network_name):
     input_param_spec = {
-        'logits': tensor_spec.TensorSpec(shape=output_shape, dtype=tf.float32)
+        'logits':
+            tensor_spec.TensorSpec(
+                shape=output_shape,
+                dtype=tf.float32,
+                name=network_name + '_logits')
     }
 
     return distribution_spec.DistributionSpec(

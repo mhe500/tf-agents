@@ -21,7 +21,9 @@ from __future__ import print_function
 
 import functools
 import os
+
 from absl import logging
+import distutils.version
 
 import tensorflow as tf
 
@@ -42,6 +44,17 @@ For unit tests, subclass `tf_agents.utils.test_utils.TestCase`.
 
 def resource_variables_enabled():
   return tf.compat.v1.resource_variables_enabled()
+
+
+_IN_LEGACY_TF1 = (
+    tf.__git_version__ != 'unknown'
+    and tf.__version__ != '1.15.0'
+    and (distutils.version.LooseVersion(tf.__version__) <=
+         distutils.version.LooseVersion('1.15.0.dev20190821')))
+
+
+def in_legacy_tf1():
+  return _IN_LEGACY_TF1
 
 
 def function(*args, **kwargs):
@@ -183,7 +196,8 @@ def soft_variables_update(source_variables,
   Returns:
     An operation that updates target variables from source variables.
   Raises:
-    ValueError: if tau is not in [0, 1].
+    ValueError: if `tau not in [0, 1]`.
+    ValueError: if `len(source_variables) != len(target_variables)`.
   """
   if tau < 0 or tau > 1:
     raise ValueError('Input `tau` should be in [0, 1].')
@@ -192,15 +206,32 @@ def soft_variables_update(source_variables,
   op_name = 'soft_variables_update'
   if tau == 0.0 or not source_variables or not target_variables:
     return tf.no_op(name=op_name)
+  if len(source_variables) != len(target_variables):
+    raise ValueError(
+        'Source and target variable lists have different lengths: '
+        '{} vs. {}'.format(len(source_variables), len(target_variables)))
   if sort_variables_by_name:
     source_variables = sorted(source_variables, key=lambda x: x.name)
     target_variables = sorted(target_variables, key=lambda x: x.name)
+
+  strategy = tf.distribute.get_strategy()
+
   for (v_s, v_t) in zip(source_variables, target_variables):
     v_t.shape.assert_is_compatible_with(v_s.shape)
-    if tau == 1.0:
-      update = v_t.assign(v_s)
+
+    def update_fn(v1, v2):
+      if tau == 1.0:
+        return v1.assign(v2)
+      else:
+        return v1.assign((1 - tau) * v1 + tau * v2)
+
+    if strategy is not None:
+      # assignment happens independently on each replica,
+      # see b/140690837 #46.
+      update = strategy.extended.update(v_t, update_fn, args=(v_s,))
     else:
-      update = v_t.assign((1 - tau) * v_t + tau * v_s)
+      update = update_fn(v_t, v_s)
+
     updates.append(update)
   return tf.group(*updates, name=op_name)
 
@@ -222,6 +253,7 @@ def join_scope(parent_scope, child_scope):
   return '/'.join([parent_scope, child_scope])
 
 
+# TODO(b/138322868): Add an optional action_spec for validation.
 def index_with_actions(q_values, actions, multi_dim_actions=False):
   """Index into q_values using actions.
 
@@ -238,7 +270,6 @@ def index_with_actions(q_values, actions, multi_dim_actions=False):
       num_actions_j). While in the single dimensional case, actions[outer_dim1,
       ... outer_dimK] is a scalar.
     multi_dim_actions: whether the actions are multidimensional.
-    # TODO(kbanoop): Add an optional action_spec for validation.
 
   Returns:
     A [outer_dim1, ... outer_dimK] tensor of q_values for the given actions.
@@ -246,9 +277,9 @@ def index_with_actions(q_values, actions, multi_dim_actions=False):
   Raises:
     ValueError: If actions have unknown rank.
   """
-  if actions.shape.ndims is None:
+  if actions.shape.rank is None:
     raise ValueError('actions should have known rank.')
-  batch_dims = actions.shape.ndims
+  batch_dims = actions.shape.rank
   if multi_dim_actions:
     # In the multidimensional case, the last dimension of actions indexes the
     # vector of actions for each batch, so exclude it from the batch dimensions.
@@ -257,11 +288,12 @@ def index_with_actions(q_values, actions, multi_dim_actions=False):
   outer_shape = tf.shape(input=actions)
   batch_indices = tf.meshgrid(
       *[tf.range(outer_shape[i]) for i in range(batch_dims)], indexing='ij')
-  batch_indices = [
-      tf.expand_dims(batch_index, -1) for batch_index in batch_indices
-  ]
+  batch_indices = [tf.cast(tf.expand_dims(batch_index, -1), dtype=tf.int32)
+                   for batch_index in batch_indices]
   if not multi_dim_actions:
     actions = tf.expand_dims(actions, -1)
+  # Cast actions to tf.int32 in order to avoid a TypeError in tf.concat.
+  actions = tf.cast(actions, dtype=tf.int32)
   action_indices = tf.concat(batch_indices + [actions], -1)
   return tf.gather_nd(q_values, action_indices)
 
@@ -541,7 +573,7 @@ def log_probability(distributions, actions, action_spec):
 
   def _compute_log_prob(single_distribution, single_action):
     # sum log-probs over everything but the batch
-    rank = single_action.shape.ndims
+    rank = single_action.shape.rank
     reduce_dims = list(range(outer_rank, rank))
     return tf.reduce_sum(
         input_tensor=single_distribution.log_prob(single_action),
@@ -579,7 +611,7 @@ def entropy(distributions, action_spec):
   def _compute_entropy(single_distribution):
     entropies = single_distribution.entropy()
     # Sum entropies over everything but the batch.
-    rank = entropies.shape.ndims
+    rank = entropies.shape.rank
     reduce_dims = list(range(outer_rank, rank))
     return tf.reduce_sum(input_tensor=entropies, axis=reduce_dims)
 
@@ -616,9 +648,9 @@ def discounted_future_sum(values, gamma, num_steps):
   Raises:
     ValueError: If values is not of rank 2.
   """
-  if values.get_shape().ndims != 2:
+  if values.get_shape().rank != 2:
     raise ValueError('Input must be rank 2 tensor.  Got %d.' %
-                     values.get_shape().ndims)
+                     values.get_shape().rank)
 
   (batch_size, total_steps) = values.get_shape().as_list()
 
@@ -654,7 +686,7 @@ def discounted_future_sum_masked(values, gamma, num_steps, episode_lengths):
   Raises:
     ValueError: If values is not of rank 2, or if total_steps is not defined.
   """
-  if values.shape.ndims != 2:
+  if values.shape.rank != 2:
     raise ValueError('Input must be a rank 2 tensor.  Got %d.' % values.shape)
 
   total_steps = tf.compat.dimension_value(values.shape[1])
@@ -686,9 +718,9 @@ def shift_values(values, gamma, num_steps, final_values=None):
   Raises:
     ValueError: If values is not of rank 2.
   """
-  if values.get_shape().ndims != 2:
+  if values.get_shape().rank != 2:
     raise ValueError('Input must be rank 2 tensor.  Got %d.' %
-                     values.get_shape().ndims)
+                     values.get_shape().rank)
 
   (batch_size, total_steps) = values.get_shape().as_list()
   num_steps = tf.minimum(num_steps, total_steps)
@@ -1041,3 +1073,74 @@ def load_spec(file_path):
 
   signature_encoder = nested_structure_coder.StructureCoder()
   return signature_encoder.decode_proto(signature_proto)
+
+
+def check_no_shared_variables(network_1, network_2):
+  """Checks that there are no shared trainable variables in the two networks.
+
+  Args:
+    network_1: A network.Network.
+    network_2: A network.Network.
+
+  Raises:
+    ValueError: if there are any common trainable variables.
+    ValueError: if one of the networks has not yet been built
+      (e.g. user must call `create_variables`).
+  """
+  variables_1 = {id(v): v for v in network_1.trainable_variables}
+  variables_2 = {id(v): v for v in network_2.trainable_variables}
+  shared = set(variables_1.keys()) & set(variables_2.keys())
+  if shared:
+    shared_variables = [variables_1[v] for v in shared]
+    raise ValueError(
+        'After making a copy of network \'{}\' to create a target '
+        'network \'{}\', the target network shares weights with '
+        'the original network.  This is not allowed.  If '
+        'you want explicitly share weights with the target network, or '
+        'if your input network shares weights with others, please '
+        'provide a target network which explicitly, selectively, shares '
+        'layers/weights with the input network.  If you are not intending to '
+        'share weights make sure all the weights are created inside the Network'
+        ' since a copy will be created by creating a new Network with the same '
+        'args but a new name. Shared variables found: '
+        '\'{}\'.'.format(network_1.name, network_2.name, shared_variables))
+
+
+def check_matching_networks(network_1, network_2):
+  """Check that two networks have matching input specs and variables.
+
+  Args:
+    network_1: A network.Network.
+    network_2: A network.Network.
+
+  Raises:
+    ValueError: if the networks differ in input_spec, variables (number, dtype,
+      or shape).
+    ValueError: if either of the networks has not been built yet
+      (e.g. user must call `create_variables`).
+  """
+  if network_1.input_tensor_spec != network_2.input_tensor_spec:
+    raise ValueError('Input tensor specs of network and target network '
+                     'do not match: {} vs. {}.'.format(
+                         network_1.input_tensor_spec,
+                         network_2.input_tensor_spec))
+  if len(network_1.variables) != len(network_2.variables):
+    raise ValueError(
+        'Variables lengths do not match between Q network and target network: '
+        '{} vs. {}'.format(network_1.variables, network_2.variables))
+  for v1, v2 in zip(network_1.variables, network_2.variables):
+    if v1.dtype != v2.dtype or v1.shape != v2.shape:
+      raise ValueError(
+          'Variable dtypes or shapes do not match: {} vs. {}'.format(v1, v2))
+
+
+def maybe_copy_target_network_with_checks(network, target_network=None,
+                                          name='TargetNetwork'):
+  if target_network is None:
+    target_network = network.copy(name=name)
+    target_network.create_variables()
+    # Copy may have been shallow, and variable may inadvertently be shared
+    # between the target and original network.
+    check_no_shared_variables(network, target_network)
+  check_matching_networks(network, target_network)
+  return target_network

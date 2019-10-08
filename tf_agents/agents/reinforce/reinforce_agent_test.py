@@ -98,7 +98,8 @@ class DummyValueNet(network.Network):
             kernel_initializer=tf.compat.v1.initializers.constant([2, 1]),
             bias_initializer=tf.compat.v1.initializers.constant([5])))
 
-  def call(self, inputs, unused_step_type=None, network_state=()):
+  def call(self, inputs, step_type=None, network_state=()):
+    del step_type
     hidden_state = tf.cast(tf.nest.flatten(inputs), tf.float32)[0]
     batch_squash = network_utils.BatchSquash(self._outer_rank)
     hidden_state = batch_squash.flatten(hidden_state)
@@ -314,7 +315,7 @@ class ReinforceAgentTest(tf.test.TestCase, parameterized.TestCase):
     else:
       loss = agent.train(experience)
 
-    self.evaluate(tf.compat.v1.initialize_all_variables())
+    self.evaluate(tf.compat.v1.global_variables_initializer())
     self.assertEqual(self.evaluate(counter), 0)
     self.evaluate(loss)
     self.assertEqual(self.evaluate(counter), 1)

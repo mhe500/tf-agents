@@ -61,6 +61,9 @@ class SacAgent(tf_agent.TFAgent):
                critic_optimizer,
                alpha_optimizer,
                actor_policy_ctor=actor_policy.ActorPolicy,
+               critic_network_2=None,
+               target_critic_network=None,
+               target_critic_network_2=None,
                target_update_tau=1.0,
                target_update_period=1,
                td_errors_loss_fn=tf.math.squared_difference,
@@ -86,6 +89,27 @@ class SacAgent(tf_agent.TFAgent):
       critic_optimizer: The default optimizer to use for the critic network.
       alpha_optimizer: The default optimizer to use for the alpha variable.
       actor_policy_ctor: The policy class to use.
+      critic_network_2: (Optional.)  A `tf_agents.network.Network` to be used as
+        the second critic network during Q learning.  The weights from
+        `critic_network` are copied if this is not provided.
+      target_critic_network: (Optional.)  A `tf_agents.network.Network` to be
+        used as the target critic network during Q learning. Every
+        `target_update_period` train steps, the weights from `critic_network`
+        are copied (possibly withsmoothing via `target_update_tau`) to `
+        target_critic_network`.  If `target_critic_network` is not provided, it
+        is created by making a copy of `critic_network`, which initializes a new
+        network with the same structure and its own layers and weights.
+        Performing a `Network.copy` does not work when the network instance
+        already has trainable parameters (e.g., has already been built, or when
+        the network is sharing layers with another).  In these cases, it is up
+        to you to build a copy having weights that are not shared with the
+        original `critic_network`, so that this can be used as a target network.
+        If you provide a `target_critic_network` that shares any weights with
+        `critic_network`, a warning will be logged but no exception is thrown.
+      target_critic_network_2: (Optional.) Similar network as
+        target_critic_network but for the critic_network_2. See documentation
+        for target_critic_network. Will only be used if 'critic_network_2' is
+        also specified.
       target_update_tau: Factor for soft update of the target networks.
       target_update_period: Period for soft update of the target networks.
       td_errors_loss_fn:  A function for computing the elementwise TD errors
@@ -93,7 +117,8 @@ class SacAgent(tf_agent.TFAgent):
       gamma: A discount factor for future rewards.
       reward_scale_factor: Multiplicative scale for the reward.
       initial_log_alpha: Initial value for log_alpha.
-      target_entropy: The target average policy entropy, for updating alpha.
+      target_entropy: The target average policy entropy, for updating alpha. The
+        default value is negative of the total number of actions.
       gradient_clipping: Norm length to clip gradients.
       debug_summaries: A bool to gather debug summaries.
       summarize_grads_and_vars: If True, gradient and network variable summaries
@@ -105,12 +130,38 @@ class SacAgent(tf_agent.TFAgent):
     """
     tf.Module.__init__(self, name=name)
 
-    self._critic_network1 = critic_network
-    self._critic_network2 = critic_network.copy(name='CriticNetwork2')
-    self._target_critic_network1 = critic_network.copy(
-        name='TargetCriticNetwork1')
-    self._target_critic_network2 = critic_network.copy(
-        name='TargetCriticNetwork2')
+    flat_action_spec = tf.nest.flatten(action_spec)
+    for spec in flat_action_spec:
+      if spec.dtype.is_integer:
+        raise NotImplementedError(
+            'SacAgent does not currently support discrete actions. '
+            'Action spec: {}'.format(action_spec))
+
+    self._critic_network_1 = critic_network
+    self._critic_network_1.create_variables()
+    if target_critic_network:
+      target_critic_network.create_variables()
+    self._target_critic_network_1 = (
+        common.maybe_copy_target_network_with_checks(self._critic_network_1,
+                                                     target_critic_network,
+                                                     'TargetCriticNetwork1'))
+
+    if critic_network_2 is not None:
+      self._critic_network_2 = critic_network_2
+    else:
+      self._critic_network_2 = critic_network.copy(name='CriticNetwork2')
+      # Do not use target_critic_network_2 if critic_network_2 is None.
+      target_critic_network_2 = None
+    self._critic_network_2.create_variables()
+    if target_critic_network_2:
+      target_critic_network_2.create_variables()
+    self._target_critic_network_2 = (
+        common.maybe_copy_target_network_with_checks(self._critic_network_2,
+                                                     target_critic_network_2,
+                                                     'TargetCriticNetwork2'))
+
+    if actor_network:
+      actor_network.create_variables()
     self._actor_network = actor_network
 
     policy = actor_policy_ctor(
@@ -166,12 +217,12 @@ class SacAgent(tf_agent.TFAgent):
     Copies weights from the Q networks to the target Q network.
     """
     common.soft_variables_update(
-        self._critic_network1.variables,
-        self._target_critic_network1.variables,
+        self._critic_network_1.variables,
+        self._target_critic_network_1.variables,
         tau=1.0)
     common.soft_variables_update(
-        self._critic_network2.variables,
-        self._target_critic_network2.variables,
+        self._critic_network_2.variables,
+        self._target_critic_network_2.variables,
         tau=1.0)
 
   def _experience_to_transitions(self, experience):
@@ -206,11 +257,13 @@ class SacAgent(tf_agent.TFAgent):
     time_steps, actions, next_time_steps = self._experience_to_transitions(
         experience)
 
-    critic_variables = (
-        self._critic_network1.variables + self._critic_network2.variables)
+    trainable_critic_variables = (
+        self._critic_network_1.trainable_variables +
+        self._critic_network_2.trainable_variables)
     with tf.GradientTape(watch_accessed_variables=False) as tape:
-      assert critic_variables, 'No critic variables to optimize.'
-      tape.watch(critic_variables)
+      assert trainable_critic_variables, ('No trainable critic variables to '
+                                          'optimize.')
+      tape.watch(trainable_critic_variables)
       critic_loss = self.critic_loss(
           time_steps,
           actions,
@@ -221,22 +274,24 @@ class SacAgent(tf_agent.TFAgent):
           weights=weights)
 
     tf.debugging.check_numerics(critic_loss, 'Critic loss is inf or nan.')
-    critic_grads = tape.gradient(critic_loss, critic_variables)
-    self._apply_gradients(critic_grads, critic_variables,
+    critic_grads = tape.gradient(critic_loss, trainable_critic_variables)
+    self._apply_gradients(critic_grads, trainable_critic_variables,
                           self._critic_optimizer)
 
-    actor_variables = self._actor_network.variables
+    trainable_actor_variables = self._actor_network.trainable_variables
     with tf.GradientTape(watch_accessed_variables=False) as tape:
-      assert actor_variables, 'No actor variables to optimize.'
-      tape.watch(actor_variables)
+      assert trainable_actor_variables, ('No trainable actor variables to '
+                                         'optimize.')
+      tape.watch(trainable_actor_variables)
       actor_loss = self.actor_loss(time_steps, weights=weights)
     tf.debugging.check_numerics(actor_loss, 'Actor loss is inf or nan.')
-    actor_grads = tape.gradient(actor_loss, actor_variables)
-    self._apply_gradients(actor_grads, actor_variables, self._actor_optimizer)
+    actor_grads = tape.gradient(actor_loss, trainable_actor_variables)
+    self._apply_gradients(actor_grads, trainable_actor_variables,
+                          self._actor_optimizer)
 
     alpha_variable = [self._log_alpha]
     with tf.GradientTape(watch_accessed_variables=False) as tape:
-      assert actor_variables, 'No actor variables to optimize.'
+      assert alpha_variable, 'No alpha variable to optimize.'
       tape.watch(alpha_variable)
       alpha_loss = self.alpha_loss(time_steps, weights=weights)
     tf.debugging.check_numerics(alpha_loss, 'Alpha loss is inf or nan.')
@@ -296,11 +351,11 @@ class SacAgent(tf_agent.TFAgent):
       def update():
         """Update target network."""
         critic_update_1 = common.soft_variables_update(
-            self._critic_network1.variables,
-            self._target_critic_network1.variables, tau)
+            self._critic_network_1.variables,
+            self._target_critic_network_1.variables, tau)
         critic_update_2 = common.soft_variables_update(
-            self._critic_network2.variables,
-            self._target_critic_network2.variables, tau)
+            self._critic_network_2.variables,
+            self._target_critic_network_2.variables, tau)
         return tf.group(critic_update_1, critic_update_2)
 
       return common.Periodically(update, period, 'update_targets')
@@ -351,10 +406,10 @@ class SacAgent(tf_agent.TFAgent):
 
       next_actions, next_log_pis = self._actions_and_log_probs(next_time_steps)
       target_input_1 = (next_time_steps.observation, next_actions)
-      target_q_values1, unused_network_state1 = self._target_critic_network1(
+      target_q_values1, unused_network_state1 = self._target_critic_network_1(
           target_input_1, next_time_steps.step_type)
       target_input_2 = (next_time_steps.observation, next_actions)
-      target_q_values2, unused_network_state2 = self._target_critic_network2(
+      target_q_values2, unused_network_state2 = self._target_critic_network_2(
           target_input_2, next_time_steps.step_type)
       target_q_values = (
           tf.minimum(target_q_values1, target_q_values2) -
@@ -365,10 +420,10 @@ class SacAgent(tf_agent.TFAgent):
           gamma * next_time_steps.discount * target_q_values)
 
       pred_input_1 = (time_steps.observation, actions)
-      pred_td_targets1, unused_network_state1 = self._critic_network1(
+      pred_td_targets1, unused_network_state1 = self._critic_network_1(
           pred_input_1, time_steps.step_type)
       pred_input_2 = (time_steps.observation, actions)
-      pred_td_targets2, unused_network_state2 = self._critic_network2(
+      pred_td_targets2, unused_network_state2 = self._critic_network_2(
           pred_input_2, time_steps.step_type)
       critic_loss1 = td_errors_loss_fn(td_targets, pred_td_targets1)
       critic_loss2 = td_errors_loss_fn(td_targets, pred_td_targets2)
@@ -411,10 +466,10 @@ class SacAgent(tf_agent.TFAgent):
 
       actions, log_pi = self._actions_and_log_probs(time_steps)
       target_input_1 = (time_steps.observation, actions)
-      target_q_values1, unused_network_state1 = self._critic_network1(
+      target_q_values1, unused_network_state1 = self._critic_network_1(
           target_input_1, time_steps.step_type)
       target_input_2 = (time_steps.observation, actions)
-      target_q_values2, unused_network_state2 = self._critic_network2(
+      target_q_values2, unused_network_state2 = self._critic_network_2(
           target_input_2, time_steps.step_type)
       target_q_values = tf.minimum(target_q_values1, target_q_values2)
       actor_loss = tf.exp(self._log_alpha) * log_pi - target_q_values

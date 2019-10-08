@@ -33,18 +33,19 @@ class EncodingNetworkTest(test_utils.TestCase):
     input_spec = tensor_spec.TensorSpec((2, 3), tf.float32)
     network = encoding_network.EncodingNetwork(input_spec,)
 
-    variables = network.variables
-    self.assertEqual(0, len(variables))
+    with self.assertRaises(ValueError):
+      network.variables  # pylint: disable=pointless-statement
 
     # Only one layer to flatten input.
-    self.assertEqual(1, len(network.layers))
+    self.assertLen(network.layers, 1)
     config = network.layers[0].get_config()
     self.assertEqual('flatten', config['name'])
 
     out, _ = network(tf.ones((1, 2, 3)))
     self.assertAllEqual(out, [[1, 1, 1, 1, 1, 1]])
+    self.assertLen(network.variables, 0)
 
-  def test_non_preprocessing_layers(self):
+  def test_non_preprocessing_layers_2d(self):
     input_spec = tensor_spec.TensorSpec((32, 32, 3), tf.float32)
     network = encoding_network.EncodingNetwork(
         input_spec,
@@ -52,6 +53,8 @@ class EncodingNetworkTest(test_utils.TestCase):
         fc_layer_params=(10, 5, 2),
         activation_fn=tf.keras.activations.tanh,
     )
+
+    network.create_variables()
 
     variables = network.variables
     self.assertEqual(10, len(variables))
@@ -81,6 +84,100 @@ class EncodingNetworkTest(test_utils.TestCase):
     self.assertEqual(10, network.layers[3].get_config()['units'])
     self.assertEqual(5, network.layers[4].get_config()['units'])
     self.assertEqual(2, network.layers[5].get_config()['units'])
+
+  def test_non_preprocessing_layers_1d(self):
+    input_spec = tensor_spec.TensorSpec((32, 3), tf.float32)
+    network = encoding_network.EncodingNetwork(
+        input_spec,
+        conv_layer_params=((16, 2, 1), (15, 2, 1)),
+        fc_layer_params=(10, 5, 2),
+        activation_fn=tf.keras.activations.tanh,
+        conv_type='1d',
+    )
+
+    network.create_variables()
+
+    variables = network.variables
+    self.assertEqual(10, len(variables))
+    self.assertEqual(6, len(network.layers))
+
+    # Validate first conv layer.
+    config = network.layers[0].get_config()
+    self.assertEqual('tanh', config['activation'])
+    self.assertEqual((2,), config['kernel_size'])
+    self.assertEqual(16, config['filters'])
+    self.assertEqual((1,), config['strides'])
+    self.assertTrue(config['trainable'])
+
+    # Validate second conv layer.
+    config = network.layers[1].get_config()
+    self.assertEqual('tanh', config['activation'])
+    self.assertEqual((2,), config['kernel_size'])
+    self.assertEqual(15, config['filters'])
+    self.assertEqual((1,), config['strides'])
+    self.assertTrue(config['trainable'])
+
+  def test_conv_raise_error(self):
+    input_spec = tensor_spec.TensorSpec((32, 3), tf.float32)
+    with self.assertRaises(ValueError):
+      _ = encoding_network.EncodingNetwork(
+          input_spec,
+          conv_layer_params=((16, 2, 1), (15, 2, 1)),
+          fc_layer_params=(10, 5, 2),
+          activation_fn=tf.keras.activations.tanh,
+          conv_type='3d')
+
+  def test_conv_dilation_params(self):
+    with self.subTest(name='no dilations'):
+      input_spec = tensor_spec.TensorSpec((32, 32, 3), tf.float32)
+      network = encoding_network.EncodingNetwork(
+          input_spec,
+          conv_layer_params=((16, 2, 1), (15, 2, 1)),
+      )
+
+      network.create_variables()
+      variables = network.variables
+
+      self.assertEqual(4, len(variables))
+      self.assertEqual(3, len(network.layers))
+
+      # Validate dilation rates
+      config = network.layers[0].get_config()
+      self.assertEqual((1, 1), config['dilation_rate'])
+      config = network.layers[1].get_config()
+      self.assertEqual((1, 1), config['dilation_rate'])
+
+    with self.subTest(name='dilations'):
+      input_spec = tensor_spec.TensorSpec((32, 32, 3), tf.float32)
+      network = encoding_network.EncodingNetwork(
+          input_spec,
+          conv_layer_params=((16, 2, 1, 2), (15, 2, 1, (2, 4))),
+      )
+
+      network.create_variables()
+      variables = network.variables
+
+      self.assertEqual(4, len(variables))
+      self.assertEqual(3, len(network.layers))
+
+      # Validate dilation rates
+      config = network.layers[0].get_config()
+      self.assertEqual((2, 2), config['dilation_rate'])
+      config = network.layers[1].get_config()
+      self.assertEqual((2, 4), config['dilation_rate'])
+
+    with self.subTest(name='failing conv spec'):
+      input_spec = tensor_spec.TensorSpec((32, 32, 3), tf.float32)
+      with self.assertRaises(ValueError):
+        network = encoding_network.EncodingNetwork(
+            input_spec,
+            conv_layer_params=((16, 2, 1, 2, 4), (15, 2, 1)),
+            )
+      with self.assertRaises(ValueError):
+        network = encoding_network.EncodingNetwork(
+            input_spec,
+            conv_layer_params=((16, 2, 1), (15, 2)),
+            )
 
   def test_preprocessing_layer_no_combiner(self):
     network = encoding_network.EncodingNetwork(
@@ -175,8 +272,18 @@ class EncodingNetworkTest(test_utils.TestCase):
         preprocessing_combiner=tf.keras.layers.Concatenate(axis=-1),
         activation_fn=tf.keras.activations.tanh,
     )
-
+    network.create_variables()
     self.assertNotEmpty(network.variables)
+
+  def testDenseFeaturesV1RaisesError(self):
+    key = 'feature_key'
+    state_dims = 5
+    column = tf.feature_column.numeric_column(key, [state_dims])
+    input_spec = {key: tensor_spec.TensorSpec([state_dims], tf.int32)}
+    dense_features = tf.compat.v1.keras.layers.DenseFeatures([column])
+    with self.assertRaisesRegexp(ValueError, 'DenseFeatures'):
+      encoding_network.EncodingNetwork(
+          input_spec, preprocessing_combiner=dense_features)
 
   def testNumericFeatureColumnInput(self):
     key = 'feature_key'
@@ -187,9 +294,9 @@ class EncodingNetworkTest(test_utils.TestCase):
     state = {key: tf.ones(input_shape, tf.int32)}
     input_spec = {key: tensor_spec.TensorSpec([state_dims], tf.int32)}
 
+    dense_features = tf.compat.v2.keras.layers.DenseFeatures([column])
     network = encoding_network.EncodingNetwork(
-        input_spec,
-        preprocessing_combiner=tf.keras.layers.DenseFeatures([column]))
+        input_spec, preprocessing_combiner=dense_features)
 
     output, _ = network(state)
     self.assertEqual(input_shape, output.shape)
@@ -205,9 +312,9 @@ class EncodingNetworkTest(test_utils.TestCase):
     state = {key: tf.expand_dims(state_input, -1)}
     input_spec = {key: tensor_spec.TensorSpec([1], tf.int32)}
 
+    dense_features = tf.compat.v2.keras.layers.DenseFeatures([column])
     network = encoding_network.EncodingNetwork(
-        input_spec,
-        preprocessing_combiner=tf.keras.layers.DenseFeatures([column]))
+        input_spec, preprocessing_combiner=dense_features)
 
     output, _ = network(state)
     expected_shape = (len(state_input), len(vocab_list))
@@ -253,9 +360,9 @@ class EncodingNetworkTest(test_utils.TestCase):
     specs[numeric_key] = tensor_spec.TensorSpec([state_dims], tf.int32)
     expected_dim += state_dims
 
+    dense_features = tf.compat.v2.keras.layers.DenseFeatures(columns.values())
     network = encoding_network.EncodingNetwork(
-        specs,
-        preprocessing_combiner=tf.keras.layers.DenseFeatures(columns.values()))
+        specs, preprocessing_combiner=dense_features)
 
     output, _ = network(tensors)
     expected_shape = (batch_size, expected_dim)

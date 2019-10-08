@@ -25,6 +25,7 @@ from __future__ import print_function
 
 import abc
 import collections
+import cProfile
 import gin
 import numpy as np
 import six
@@ -61,6 +62,9 @@ class PyEnvironmentBaseWrapper(py_environment.PyEnvironment):
 
   def _step(self, action):
     return self._env.step(action)
+
+  def get_info(self):
+    return self._env.get_info()
 
   def observation_spec(self):
     return self._env.observation_spec()
@@ -115,6 +119,64 @@ class TimeLimit(PyEnvironmentBaseWrapper):
 
 
 @gin.configurable
+class PerformanceProfiler(PyEnvironmentBaseWrapper):
+  """End episodes after specified number of steps."""
+
+  def __init__(self, env, process_profile_fn, process_steps):
+    """Create a PerformanceProfiler that uses cProfile to profile env execution.
+
+    Args:
+      env: Environment to wrap.
+      process_profile_fn: A callback that accepts a `Profile` object.
+        After `process_profile_fn` is called, profile information is reset.
+      process_steps: The frequency with which `process_profile_fn` is
+        called.  The counter is incremented each time `step` is called
+        (not `reset`); every `process_steps` steps, `process_profile_fn`
+        is called and the profiler is reset.
+    """
+    super(PerformanceProfiler, self).__init__(env)
+    self._started = False
+    self._num_steps = 0
+    self._process_steps = process_steps
+    self._process_profile_fn = process_profile_fn
+    self._profile = cProfile.Profile()
+
+  def _reset(self):
+    self._profile.enable()
+    try:
+      return self._env.reset()
+    finally:
+      self._profile.disable()
+
+  def _step(self, action):
+    if not self._started:
+      self._started = True
+      self._num_steps += 1
+      return self.reset()
+
+    self._profile.enable()
+    try:
+      time_step = self._env.step(action)
+    finally:
+      self._profile.disable()
+
+    self._num_steps += 1
+    if self._num_steps >= self._process_steps:
+      self._process_profile_fn(self._profile)
+      self._profile = cProfile.Profile()
+      self._num_steps = 0
+
+    if time_step.is_last():
+      self._started = False
+
+    return time_step
+
+  @property
+  def duration(self):
+    return self._duration
+
+
+@gin.configurable
 class ActionRepeat(PyEnvironmentBaseWrapper):
   """Repeates actions over n-steps while acummulating the received reward."""
 
@@ -140,9 +202,11 @@ class ActionRepeat(PyEnvironmentBaseWrapper):
     for _ in range(self._times):
       time_step = self._env.step(action)
       total_reward += time_step.reward
-      if time_step.is_last():
+      if time_step.is_first() or time_step.is_last():
         break
 
+    total_reward = np.asarray(total_reward,
+                              dtype=np.asarray(time_step.reward).dtype)
     return ts.TimeStep(time_step.step_type, total_reward, time_step.discount,
                        time_step.observation)
 
@@ -537,9 +601,9 @@ class FlattenObservationsWrapper(PyEnvironmentBaseWrapper):
 
     # Flatten the individual observations if they are multi-dimensional and then
     # flatten the nested structure.
-    observations = tf.nest.map_structure(np_flatten, observations)
+    flat_observations = [np_flatten(x) for x in tf.nest.flatten(observations)]
     axis = 1 if is_batched else 0
-    return np.concatenate(tf.nest.flatten(observations), axis=axis)
+    return np.concatenate(flat_observations, axis=axis)
 
   def _step(self, action):
     """Steps the environment while packing the observations returned.

@@ -121,8 +121,19 @@ class CategoricalQNetwork(network.Network):
   def num_atoms(self):
     return self._num_atoms
 
-  def call(self, observations, step_type=None, network_state=()):
-    logits, network_state = self._q_network.call(observations, step_type,
-                                                 network_state)
+  def call(self, observation, step_type=None, network_state=()):
+    """Runs the given observation through the network.
+
+    Args:
+      observation: The observation to provide to the network.
+      step_type: The step type for the given observation. See `StepType` in
+        time_step.py.
+      network_state: A state tuple to pass to the network, mainly used by RNNs.
+
+    Returns:
+      A tuple `(logits, network_state)`.
+    """
+    logits, network_state = self._q_network(
+        observation, step_type, network_state)
     logits = tf.reshape(logits, [-1, self._num_actions, self._num_atoms])
     return logits, network_state
