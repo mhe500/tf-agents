@@ -30,7 +30,6 @@ import collections
 
 import gin
 import tensorflow as tf
-
 from tf_agents.agents import tf_agent
 from tf_agents.policies import boltzmann_policy
 from tf_agents.policies import epsilon_greedy_policy
@@ -41,6 +40,7 @@ from tf_agents.utils import common
 from tf_agents.utils import composite
 from tf_agents.utils import eager_utils
 from tf_agents.utils import nest_utils
+from tf_agents.utils import training
 from tf_agents.utils import value_ops
 
 
@@ -350,22 +350,25 @@ class DqnAgent(tf_agent.TFAgent):
           weights=weights)
     tf.debugging.check_numerics(loss_info[0], 'Loss is inf or nan')
     variables_to_train = self._q_network.trainable_weights
+    non_trainable_weights = self._q_network.non_trainable_weights
     assert list(variables_to_train), "No variables in the agent's q_network."
     grads = tape.gradient(loss_info.loss, variables_to_train)
     # Tuple is used for py3, where zip is a generator producing values once.
-    grads_and_vars = tuple(zip(grads, variables_to_train))
+    grads_and_vars = list(zip(grads, variables_to_train))
     if self._gradient_clipping is not None:
       grads_and_vars = eager_utils.clip_gradient_norms(grads_and_vars,
                                                        self._gradient_clipping)
 
     if self._summarize_grads_and_vars:
-      eager_utils.add_variables_summaries(grads_and_vars,
+      grads_and_vars_with_non_trainable = (
+          grads_and_vars + [(None, v) for v in non_trainable_weights])
+      eager_utils.add_variables_summaries(grads_and_vars_with_non_trainable,
                                           self.train_step_counter)
       eager_utils.add_gradients_summaries(grads_and_vars,
                                           self.train_step_counter)
-
-    self._optimizer.apply_gradients(grads_and_vars,
-                                    global_step=self.train_step_counter)
+    training.apply_gradients(self._optimizer,
+                             grads_and_vars,
+                             global_step=self.train_step_counter)
 
     self._update_target()
 
