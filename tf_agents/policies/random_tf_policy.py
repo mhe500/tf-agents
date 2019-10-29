@@ -21,6 +21,8 @@ from __future__ import print_function
 import tensorflow as tf
 from tf_agents.distributions import masked
 from tf_agents.policies import tf_policy
+from tf_agents.policies.q_policy import QPolicyInfo
+from tf_agents.specs import TensorSpec
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import policy_step
 from tf_agents.utils import nest_utils
@@ -38,7 +40,12 @@ def _uniform_probability(action_spec):
 class RandomTFPolicy(tf_policy.Base):
   """Returns random samples of the given action_spec."""
 
-  def __init__(self, time_step_spec, action_spec, *args, **kwargs):
+  def __init__(self, time_step_spec, action_spec, emit_q_values=False, *args, **kwargs):
+    self.emit_q_values = emit_q_values
+    if emit_q_values:
+        info_spec = QPolicyInfo(q_values=TensorSpec(shape=action_spec.maximum + 1, dtype=tf.float32))
+    else:
+        info_spec = ()
     self._observation_and_action_constraint_splitter = (
         kwargs.pop('observation_and_action_constraint_splitter', None))
 
@@ -58,7 +65,9 @@ class RandomTFPolicy(tf_policy.Base):
             'shaped as () or (1,) or their equivalent list forms.')
 
     super(RandomTFPolicy, self).__init__(
-        time_step_spec, action_spec, *args, **kwargs)
+        time_step_spec, action_spec, info_spec=info_spec, *args, **kwargs)
+    if self.emit_q_values and self.emit_log_probability:
+      raise ValueError("Cannot emit log probability and Q-values simultaneously.")
 
   @property
   def observation_and_action_constraint_splitter(self):
@@ -106,6 +115,10 @@ class RandomTFPolicy(tf_policy.Base):
         log_probability = tf.nest.map_structure(tf.math.log, action_probability)
 
       info = policy_step.PolicyInfo(log_probability=log_probability)
+      return step._replace(info=info)
+    elif self.emit_q_values:
+      info = QPolicyInfo(q_values=tf.zeros(shape=self.info_spec.q_values.shape, dtype=self.info_spec.q_values.dtype))
+      info = nest_utils.batch_nested_tensors(info, self.info_spec)
       return step._replace(info=info)
 
     return step

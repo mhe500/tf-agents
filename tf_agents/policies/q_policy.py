@@ -19,14 +19,18 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import collections
+
 import gin
 import numpy as np
 import tensorflow as tf
 
 from tf_agents.distributions import shifted_categorical
 from tf_agents.policies import tf_policy
+from tf_agents.specs import TensorSpec
 from tf_agents.trajectories import policy_step
 
+QPolicyInfo = collections.namedtuple('QPolicyInfo', 'q_values')
 
 @gin.configurable
 class QPolicy(tf_policy.Base):
@@ -38,6 +42,7 @@ class QPolicy(tf_policy.Base):
                q_network,
                observation_and_action_constraint_splitter=None,
                emit_log_probability=False,
+               emit_q_values=False,
                name=None):
     """Builds a Q-Policy given a q_network.
 
@@ -75,6 +80,7 @@ class QPolicy(tf_policy.Base):
       NotImplementedError: If `action_spec` contains more than one
         `BoundedTensorSpec`.
     """
+    self.emit_q_values = emit_q_values
     self._observation_and_action_constraint_splitter = (
         observation_and_action_constraint_splitter)
     network_action_spec = getattr(q_network, 'action_spec', None)
@@ -94,9 +100,16 @@ class QPolicy(tf_policy.Base):
     self._flat_action_spec = flat_action_spec[0]
     q_network.create_variables()
     self._q_network = q_network
+
+    if emit_q_values:
+        info_spec = QPolicyInfo(q_values=TensorSpec(shape=action_spec.maximum + 1, dtype=tf.float32))
+    else:
+        info_spec = ()
+
     super(QPolicy, self).__init__(
         time_step_spec,
         action_spec,
+        info_spec=info_spec,
         policy_state_spec=q_network.state_spec,
         clip=False,
         emit_log_probability=emit_log_probability,
@@ -152,4 +165,8 @@ class QPolicy(tf_policy.Base):
         dtype=self._flat_action_spec.dtype,
         shift=self._flat_action_spec.minimum)
     distribution = tf.nest.pack_sequence_as(self._action_spec, [distribution])
-    return policy_step.PolicyStep(distribution, policy_state)
+    if self.emit_q_values:
+        info = QPolicyInfo(q_values=logits)
+    else:
+        info = ()
+    return policy_step.PolicyStep(distribution, policy_state, info)

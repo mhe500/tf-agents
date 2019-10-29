@@ -97,6 +97,7 @@ class DqnAgent(tf_agent.TFAgent):
       n_step_update=1,
       boltzmann_temperature=None,
       emit_log_probability=False,
+      emit_q_values=False,
       # Params for target network updates
       target_q_network=None,
       target_update_tau=1.0,
@@ -236,7 +237,8 @@ class DqnAgent(tf_agent.TFAgent):
 
     policy, collect_policy = self._setup_policy(time_step_spec, action_spec,
                                                 boltzmann_temperature,
-                                                emit_log_probability)
+                                                emit_log_probability,
+                                                emit_q_values)
 
     if q_network.state_spec and n_step_update != 1:
       raise NotImplementedError(
@@ -272,13 +274,14 @@ class DqnAgent(tf_agent.TFAgent):
               [spec.minimum for spec in flat_action_spec]))
 
   def _setup_policy(self, time_step_spec, action_spec,
-                    boltzmann_temperature, emit_log_probability):
+                    boltzmann_temperature, emit_log_probability, emit_q_values):
 
     policy = q_policy.QPolicy(
         time_step_spec,
         action_spec,
         q_network=self._q_network,
         emit_log_probability=emit_log_probability,
+        emit_q_values=emit_q_values,
         observation_and_action_constraint_splitter=(
             self._observation_and_action_constraint_splitter))
 
