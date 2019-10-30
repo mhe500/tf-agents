@@ -117,8 +117,7 @@ class RandomTFPolicy(tf_policy.Base):
       info = policy_step.PolicyInfo(log_probability=log_probability)
       return step._replace(info=info)
     elif self.emit_q_values:
-      info = QPolicyInfo(q_values=tf.zeros(shape=self.info_spec.q_values.shape, dtype=self.info_spec.q_values.dtype))
-      info = nest_utils.batch_nested_tensors(info, self.info_spec)
+      info = QPolicyInfo(q_values=tf.zeros(shape=tf.concat([outer_dims, self.info_spec.q_values.shape], axis=0), dtype=self.info_spec.q_values.dtype))
       return step._replace(info=info)
 
     return step
