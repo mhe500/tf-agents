@@ -43,7 +43,9 @@ class RandomTFPolicy(tf_policy.Base):
   def __init__(self, time_step_spec, action_spec, emit_q_values=False, *args, **kwargs):
     self.emit_q_values = emit_q_values
     if emit_q_values:
-        info_spec = QPolicyInfo(q_values=TensorSpec(shape=action_spec.maximum + 1, dtype=tf.float32))
+        info_spec = tf.nest.map_structure(lambda spec:
+                                          QPolicyInfo(q_values=TensorSpec(shape=(spec.maximum + 1), dtype=tf.float32)),
+                                          action_spec)
     else:
         info_spec = ()
     self._observation_and_action_constraint_splitter = (
@@ -117,7 +119,8 @@ class RandomTFPolicy(tf_policy.Base):
       info = policy_step.PolicyInfo(log_probability=log_probability)
       return step._replace(info=info)
     elif self.emit_q_values:
-      info = QPolicyInfo(q_values=tf.zeros(shape=tf.concat([outer_dims, self.info_spec.q_values.shape], axis=0), dtype=self.info_spec.q_values.dtype))
+      info = tf.nest.map_structure(lambda spec: tf.zeros(shape=tf.concat([outer_dims, spec.shape], axis=0),
+                                                         dtype=spec.dtype), self.info_spec)
       return step._replace(info=info)
 
     return step
